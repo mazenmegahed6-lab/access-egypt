@@ -5,13 +5,13 @@
  * Tailwind: v3.3+ (logical utilities ms-/me-/ps-/pe-/text-start work for RTL)
  * Add to app/layout.tsx:  import "maplibre-gl/dist/maplibre-gl.css";
  * Fonts: load "IBM Plex Sans Arabic" + "IBM Plex Sans" with next/font.
- * API: GET /api/venues?lat&lng&r&q&features=a,b  -> Venue[]  (falls back to DEMO data)
+ * API: GET /api/venues?lat&lng&r&q&features=a,b  -> Venue[]
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 
 type Lang = "ar" | "en";
-type FeatureKey = "step_free" | "ramp" | "elevator" | "ground_floor" | "restroom" | "parking";
+type FeatureKey = "step_free" | "ramp" | "elevator" | "ground_floor" | "restroom" | "parking" | "auto_door" | "wide_aisles" | "low_counter";
 type Venue = {
   id: string; name_ar: string; name_en: string; category: string;
   lat: number; lng: number; address_ar: string; address_en: string;
@@ -27,14 +27,22 @@ const T = {
     gov: "المحافظة", filters: "مواصفات الوصول", results: "نتيجة", none: "لا توجد نتائج. جرّب إزالة بعض الفلاتر أو أضف مكانًا.",
     unknown: "غير معروف", verified: ["مستورد", "بلاغ مستخدم", "مؤكد من المجتمع", "تم التدقيق"],
     report: "أبلغ عن مدخل هذا المكان", call: "اتصل", lang: "English", m: "م", map: "الخريطة", list: "القائمة",
-    geoFail: "تعذر تحديد موقعك. اختر المحافظة يدويًا.", loadFail: "تعذر تحميل البيانات الحية. نعرض بيانات تجريبية.",
+    geoFail: "تعذر تحديد موقعك. اختر المحافظة يدويًا.", loadFail: "تعذر تحميل الأماكن. تحقق من الاتصال وأعد المحاولة.",
+    dir: "الاتجاهات", gmaps: "افتح في خرائط جوجل", route: "المسار", walk: "مشيًا", km: "كم", min: "دقيقة",
+    routeFail: "تعذر حساب المسار. جرّب خرائط جوجل.", locating: "جارٍ تحديد موقعك…", clear: "إلغاء المسار",
+    routeNote: "قد يتضمن المسار سلالم أو أرصفة غير مناسبة. راجع ملاحظات الوصول قبل الذهاب.",
+    cat: "الفئة", allCat: "كل الفئات", footer: "تفاصيل الوصول المعروضة بيانات عينة لمشروع طلابي · الخرائط © مساهمو OpenStreetMap",
   },
   en: {
     title: "Access For All", search: "Search a place or area (e.g. Maadi)", locate: "Use my location",
     gov: "Governorate", filters: "Access features", results: "results", none: "No results. Try removing a filter or add a place.",
     unknown: "Unknown", verified: ["Imported", "User report", "Community confirmed", "Audited"],
     report: "Report this entrance", call: "Call", lang: "العربية", m: "m", map: "Map", list: "List",
-    geoFail: "Couldn't get your location. Pick a governorate instead.", loadFail: "Couldn't load live data. Showing demo data.",
+    geoFail: "Couldn't get your location. Pick a governorate instead.", loadFail: "Couldn't load places. Check your connection and try again.",
+    dir: "Directions", gmaps: "Open in Google Maps", route: "Route", walk: "walking", km: "km", min: "min",
+    routeFail: "Couldn't calculate the route. Try Google Maps.", locating: "Finding your location…", clear: "Clear route",
+    routeNote: "The route may include stairs or uneven pavement. Check the access notes before you go.",
+    cat: "Category", allCat: "All categories", footer: "Accessibility details shown are sample data for a student project · Map © OpenStreetMap contributors",
   },
 } as const;
 
@@ -45,7 +53,19 @@ const FEATURES: { key: FeatureKey; ar: string; en: string; icon: string }[] = [
   { key: "ground_floor", ar: "دور أرضي", en: "Ground floor", icon: "▁" },
   { key: "restroom", ar: "دورة مياه مجهزة", en: "Accessible restroom", icon: "♿" },
   { key: "parking", ar: "موقف سيارات مجهز", en: "Accessible parking", icon: "P" },
+  { key: "auto_door", ar: "باب أوتوماتيك", en: "Automatic door", icon: "⇥" },
+  { key: "wide_aisles", ar: "ممرات واسعة", en: "Wide aisles", icon: "↔" },
+  { key: "low_counter", ar: "كاونتر منخفض", en: "Lowered counter", icon: "▃" },
 ];
+
+const CATS: Record<string, [string, string]> = {
+  pharmacy: ["صيدلية", "Pharmacy"], supermarket: ["سوبرماركت", "Supermarket"], mall: ["مول", "Mall"],
+  bakery: ["مخبز", "Bakery"], clothes: ["ملابس", "Clothes"], shoes: ["أحذية", "Shoes"],
+  jewelry: ["مجوهرات", "Jewellery"], electronics: ["إلكترونيات", "Electronics"], books: ["مكتبة", "Books"],
+  furniture: ["أثاث", "Furniture"], optician: ["نظارات", "Optician"], beauty: ["تجميل", "Beauty"],
+  sports: ["رياضة", "Sports"], toys: ["ألعاب", "Toys"], butcher: ["جزارة", "Butcher"], shop: ["متجر", "Shop"],
+  cafe: ["كافيه", "Café"], restaurant: ["مطعم", "Restaurant"], bank: ["بنك", "Bank"], clinic: ["عيادة", "Clinic"],
+};
 
 const GOVS = [
   { id: "cairo", ar: "القاهرة", en: "Cairo", c: [31.2357, 30.0444] },
@@ -77,28 +97,19 @@ const expandQuery = (q: string): string[] => {
   return group ? group.map(norm) : [n];
 };
 
-const DEMO: Venue[] = [
-  { id: "1", name_ar: "صيدلية العزبي", name_en: "El Ezaby Pharmacy", category: "pharmacy", lat: 29.9602, lng: 31.2569,
-    address_ar: "شارع 9، المعادي", address_en: "Street 9, Maadi", phone: "19600", hours: "24/7", confidence: 2,
-    features: { step_free: "yes", ground_floor: "yes", ramp: "no" } },
-  { id: "2", name_ar: "كافيه ريفييرا", name_en: "Riviera Café", category: "cafe", lat: 30.0459, lng: 31.2395,
-    address_ar: "باب اللوق، وسط البلد", address_en: "Bab El Louk, Downtown", hours: "10:00–00:00", confidence: 1,
-    features: { ramp: "yes", step_free: "yes", restroom: "no" } },
-  { id: "3", name_ar: "مركز سيتي ستارز - مدخل 2", name_en: "City Stars – Gate 2", category: "mall", lat: 30.0728, lng: 31.3459,
-    address_ar: "مدينة نصر", address_en: "Nasr City", confidence: 3,
-    features: { step_free: "yes", elevator: "yes", restroom: "yes", parking: "yes", ground_floor: "yes" } },
-];
 
 export default function Home() {
   const [lang, setLang] = useState<Lang>("ar");
   const [query, setQuery] = useState("");
   const [gov, setGov] = useState<string>("cairo");
   const [active, setActive] = useState<Set<FeatureKey>>(new Set());
-  const [venues, setVenues] = useState<Venue[]>(DEMO);
+  const [venues, setVenues] = useState<Venue[]>([]);
   const [center, setCenter] = useState<[number, number]>([31.2357, 30.0444]);
   const [selected, setSelected] = useState<Venue | null>(null);
   const [notice, setNotice] = useState("");
   const [view, setView] = useState<"list" | "map">("list"); // mobile toggle
+  const [cat, setCat] = useState("all");
+  const [userPos, setUserPos] = useState<[number, number] | null>(null);
   const t = T[lang];
   const dir = lang === "ar" ? "rtl" : "ltr";
 
@@ -115,41 +126,41 @@ export default function Home() {
   const toggleFeature = (k: FeatureKey) =>
     setActive((p) => { const n = new Set(p); n.has(k) ? n.delete(k) : n.add(k); return n; });
 
-  // Fetch from API (debounced); fall back to demo data so the template runs standalone.
+  // Fetch from API (debounced); shows an error notice if it fails.
   useEffect(() => {
     const ctrl = new AbortController();
     const id = setTimeout(async () => {
       try {
         const qs = new URLSearchParams({
           lat: String(center[1]), lng: String(center[0]), r: "15000",
-          q: query, features: [...active].join(","),
+          q: query, features: [...active].join(","), category: cat === "all" ? "" : cat,
         });
         const res = await fetch(`/api/venues?${qs}`, { signal: ctrl.signal });
         if (!res.ok) throw new Error();
         setVenues(await res.json());
         setNotice("");
       } catch (e: any) {
-        if (e?.name !== "AbortError") { setVenues(DEMO); setNotice(t.loadFail); }
+        if (e?.name !== "AbortError") { setVenues([]); setNotice(t.loadFail); }
       }
     }, 300);
     return () => { clearTimeout(id); ctrl.abort(); };
-  }, [center, query, active, t.loadFail]);
+  }, [center, query, active, cat, t.loadFail]);
 
-  // Client-side filtering too (instant feedback + demo mode). "Unknown" never counts as a match.
+  // Client-side filtering too (instant feedback). "Unknown" never counts as a match.
   const shown = useMemo(() => {
     const terms = expandQuery(query);
     return venues.filter((v) => {
       const okFeat = [...active].every((k) => v.features[k] === "yes");
       const hay = norm(`${v.name_ar} ${v.name_en} ${v.address_ar} ${v.address_en}`);
       const okQ = !terms.length || terms.some((x) => hay.includes(x));
-      return okFeat && okQ;
+      return okFeat && okQ && (cat === "all" || v.category === cat);
     });
-  }, [venues, active, query]);
+  }, [venues, active, query, cat]);
 
   const locate = useCallback(() => {
     if (!navigator.geolocation) return setNotice(t.geoFail);
     navigator.geolocation.getCurrentPosition(
-      (p) => { setCenter([p.coords.longitude, p.coords.latitude]); setNotice(""); },
+      (p) => { setCenter([p.coords.longitude, p.coords.latitude]); setUserPos([p.coords.longitude, p.coords.latitude]); setNotice(""); },
       () => setNotice(t.geoFail),
       { enableHighAccuracy: true, timeout: 8000 }
     );
@@ -165,6 +176,59 @@ export default function Home() {
   const mapEl = useRef<HTMLDivElement>(null);
   const map = useRef<maplibregl.Map | null>(null);
   const markers = useRef<maplibregl.Marker[]>([]);
+  const userMarker = useRef<maplibregl.Marker | null>(null);
+  const [route, setRoute] = useState<{ km: number; min: number } | null>(null);
+  const [routeBusy, setRouteBusy] = useState(false);
+
+  const clearRoute = useCallback(() => {
+    const m = map.current;
+    if (m?.getLayer("route-line")) m.removeLayer("route-line");
+    if (m?.getSource("route")) m.removeSource("route");
+    setRoute(null);
+  }, []);
+  useEffect(() => { clearRoute(); }, [selected?.id, clearRoute]);
+
+  const gmaps = (v: Venue) =>
+    `https://www.google.com/maps/dir/?api=1${userPos ? `&origin=${userPos[1]},${userPos[0]}` : ""}&destination=${v.lat},${v.lng}&travelmode=walking`;
+
+  // Walking route from the person's location to the chosen place (free OSM-based router, no key).
+  const getDirections = async (v: Venue) => {
+    setRouteBusy(true); setNotice(t.locating);
+    try {
+      const me: [number, number] = userPos ?? await new Promise<[number, number]>((res, rej) =>
+        navigator.geolocation
+          ? navigator.geolocation.getCurrentPosition((p) => res([p.coords.longitude, p.coords.latitude]), rej, { enableHighAccuracy: true, timeout: 10000 })
+          : rej(new Error("no geolocation")));
+      setUserPos(me);
+      const r = await fetch(`https://routing.openstreetmap.de/routed-foot/route/v1/foot/${me[0]},${me[1]};${v.lng},${v.lat}?overview=full&geometries=geojson`);
+      const rt = (await r.json()).routes?.[0];
+      if (!rt) throw new Error("no route");
+      const coords: [number, number][] = rt.geometry.coordinates;
+      const m = map.current!;
+      const data: any = { type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: coords } };
+      const src = m.getSource("route") as maplibregl.GeoJSONSource | undefined;
+      if (src) src.setData(data);
+      else {
+        m.addSource("route", { type: "geojson", data });
+        m.addLayer({ id: "route-line", type: "line", source: "route", paint: { "line-color": "#0B3D91", "line-width": 6 } });
+      }
+      const b = new maplibregl.LngLatBounds(coords[0], coords[0]);
+      coords.forEach((c) => b.extend(c));
+      b.extend(me);
+      m.fitBounds(b, { padding: 70 });
+      setRoute({ km: rt.distance / 1000, min: Math.round(rt.duration / 60) });
+      setNotice("");
+    } catch { setNotice(t.routeFail); }
+    setRouteBusy(false);
+  };
+
+  useEffect(() => {
+    if (!map.current || !userPos) return;
+    userMarker.current?.remove();
+    const el = document.createElement("div");
+    el.className = "h-5 w-5 rounded-full border-4 border-white bg-[#1A73E8] shadow-lg";
+    userMarker.current = new maplibregl.Marker({ element: el }).setLngLat(userPos).addTo(map.current);
+  }, [userPos]);
 
   useEffect(() => {
     if (!mapEl.current || map.current) return;
@@ -202,6 +266,7 @@ export default function Home() {
   useEffect(() => { if (view === "map") setTimeout(() => map.current?.resize(), 50); }, [view]);
 
   const name = (v: Venue) => (lang === "ar" ? v.name_ar : v.name_en);
+  const catLabel = (c: string) => (CATS[c] ? CATS[c][lang === "ar" ? 0 : 1] : c);
   const addr = (v: Venue) => (lang === "ar" ? v.address_ar : v.address_en);
 
   return (
@@ -240,6 +305,15 @@ export default function Home() {
             </div>
           </form>
 
+          <div>
+            <label htmlFor="cat" className="sr-only">{t.cat}</label>
+            <select id="cat" value={cat} onChange={(e) => setCat(e.target.value)}
+              className="w-full min-h-[52px] rounded-lg border-2 border-[#0A0A0A] px-3 bg-white">
+              <option value="all">{t.allCat}</option>
+              {Object.keys(CATS).map((k) => <option key={k} value={k}>{CATS[k][lang === "ar" ? 0 : 1]}</option>)}
+            </select>
+          </div>
+
           <fieldset>
             <legend className="font-bold mb-2">{t.filters}</legend>
             <div className="flex flex-wrap gap-2">
@@ -273,9 +347,10 @@ export default function Home() {
             {shown.length === 0 && <li className="p-4 border-2 border-dashed border-[#0A0A0A] rounded-lg">{t.none}</li>}
             {shown.map((v) => (
               <li key={v.id}>
-                <button onClick={() => { setSelected(v); map.current?.flyTo({ center: [v.lng, v.lat], zoom: 16 }); }}
+                <button onClick={() => { setSelected(v); if (window.innerWidth < 1024) setView("map"); map.current?.flyTo({ center: [v.lng, v.lat], zoom: 16 }); }}
                   className="w-full text-start p-4 rounded-lg border-2 border-[#0A0A0A] hover:bg-[#F2F6FF] focus-visible:outline focus-visible:outline-4 focus-visible:outline-[#FFC400]">
                   <span className="block font-bold">{name(v)}</span>
+                  <span className="inline-block text-sm bg-[#F2F6FF] border border-[#B9C6E0] rounded px-2">{catLabel(v.category)}</span>
                   <span className="block text-[#333]">{addr(v)}</span>
                   <span className="mt-2 flex flex-wrap gap-1.5">
                     {FEATURES.map((f) => {
@@ -299,22 +374,31 @@ export default function Home() {
         <section aria-label={t.map} className={`${view === "list" ? "hidden lg:block" : ""} relative`}>
           <div ref={mapEl} className="h-[70vh] lg:h-[calc(100vh-7rem)] rounded-lg border-2 border-[#0A0A0A]" />
           {selected && (
-            <aside aria-live="polite" className="absolute bottom-3 inset-x-3 bg-white border-2 border-[#0A0A0A] rounded-lg p-4 shadow-xl">
+            <aside aria-live="polite" className="absolute bottom-3 inset-x-3 max-h-[65%] overflow-auto bg-white border-2 border-[#0A0A0A] rounded-lg p-4 shadow-xl">
               <div className="flex justify-between gap-2">
                 <h2 className="font-bold text-xl">{name(selected)}</h2>
-                <button onClick={() => setSelected(null)} aria-label={lang === "ar" ? "إغلاق" : "Close"}
+                <button onClick={() => { setSelected(null); clearRoute(); }} aria-label={lang === "ar" ? "إغلاق" : "Close"}
                   className="min-h-[44px] min-w-[44px] text-2xl">×</button>
               </div>
               <p>{addr(selected)}</p>
               {selected.hours && <p>{selected.hours}</p>}
-              <div className="mt-3 flex gap-2">
-                {selected.phone && <a href={`tel:${selected.phone}`} className="min-h-[48px] px-4 py-2 rounded-lg bg-[#0B3D91] text-white font-semibold">{t.call} {selected.phone}</a>}
-                <a href={`/venues/${selected.id}/report`} className="min-h-[48px] px-4 py-2 rounded-lg border-2 border-[#0A0A0A] font-semibold">{t.report}</a>
+              {route && <p className="mt-2 font-semibold">{t.route}: {route.km.toFixed(1)} {t.km} · ~{route.min} {t.min} {t.walk}</p>}
+              {route && <p className="text-sm">{t.routeNote}</p>}
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button onClick={() => getDirections(selected)} disabled={routeBusy}
+                  className="min-h-[48px] px-4 py-2 rounded-lg bg-[#0B3D91] text-white font-semibold disabled:opacity-60">
+                  {routeBusy ? t.locating : t.dir}
+                </button>
+                <a href={gmaps(selected)} target="_blank" rel="noopener noreferrer"
+                  className="min-h-[48px] px-4 py-2 rounded-lg border-2 border-[#0A0A0A] font-semibold">{t.gmaps}</a>
+                {selected.phone && <a href={`tel:${selected.phone}`} className="min-h-[48px] px-4 py-2 rounded-lg border-2 border-[#0A0A0A] font-semibold">{t.call} {selected.phone}</a>}
+                {route && <button onClick={clearRoute} className="min-h-[48px] px-4 py-2 rounded-lg border-2 border-[#0A0A0A] font-semibold">{t.clear}</button>}
               </div>
             </aside>
           )}
         </section>
       </main>
+      <footer className="mx-auto max-w-7xl px-4 pb-6 text-sm">{t.footer}</footer>
     </div>
   );
 }

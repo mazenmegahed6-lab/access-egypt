@@ -24,29 +24,29 @@ function tiles(box, step = 0.5) {
 
 const query = ([s, w, n, e]) => `[out:json][timeout:180];
 (
-  nwr["name"]["amenity"~"^(pharmacy|cafe|restaurant|fast_food|bank|clinic|hospital|doctors|dentist|place_of_worship|townhall|public_service)$"](${s},${w},${n},${e});
-  nwr["name"]["shop"~"^(mall|department_store|supermarket|convenience|bakery)$"](${s},${w},${n},${e});
-  nwr["name"]["tourism"~"^(hotel|museum)$"](${s},${w},${n},${e});
-  nwr["name"]["railway"="station"]["station"="subway"](${s},${w},${n},${e});
+  nwr["name"]["amenity"~"^(pharmacy|cafe|restaurant|fast_food|bank|clinic|hospital|doctors|dentist)$"](${s},${w},${n},${e});
+  nwr["name"]["shop"](${s},${w},${n},${e});
 );
 out center tags;`;
 
+// Map OpenStreetMap tags to the app's categories (all kinds of shops, no towns or landmarks).
+const SHOP = {
+  mall: "mall", department_store: "mall", supermarket: "supermarket", convenience: "supermarket",
+  greengrocer: "supermarket", bakery: "bakery", pastry: "bakery", chemist: "pharmacy",
+  clothes: "clothes", boutique: "clothes", fashion: "clothes", fabric: "clothes", shoes: "shoes", bag: "shoes",
+  jewelry: "jewelry", electronics: "electronics", mobile_phone: "electronics", computer: "electronics",
+  appliance: "electronics", books: "books", stationery: "books", furniture: "furniture", doityourself: "furniture",
+  hardware: "furniture", optician: "optician", hairdresser: "beauty", beauty: "beauty", cosmetics: "beauty",
+  sports: "sports", toys: "toys", butcher: "butcher",
+};
 function category(t) {
-  const a = t.amenity, s = t.shop;
+  const a = t.amenity;
   if (a === "pharmacy") return "pharmacy";
   if (a === "cafe") return "cafe";
   if (a === "restaurant" || a === "fast_food") return "restaurant";
   if (a === "bank") return "bank";
   if (["clinic", "hospital", "doctors", "dentist"].includes(a)) return "clinic";
-  if (a === "place_of_worship") return t.religion === "muslim" ? "mosque" : "office";
-  if (a === "townhall" || a === "public_service") return "office";
-  if (s === "mall" || s === "department_store") return "mall";
-  if (s === "supermarket" || s === "convenience") return "supermarket";
-  if (s === "bakery") return "bakery";
-  if (t.tourism === "hotel") return "hotel";
-  if (t.tourism === "museum") return "culture";
-  if (t.railway === "station") return "metro";
-  return "office";
+  return SHOP[t.shop] || "shop";
 }
 
 // wheelchair=yes -> step_free yes; =no -> step_free no; =limited -> left unknown on purpose.

@@ -11,12 +11,13 @@ const FEATURES = ["step_free", "ramp", "elevator", "ground_floor", "restroom", "
 const norm = (s: string) =>
   s.toLowerCase().trim().replace(/[\u064B-\u065F\u0640]/g, "").replace(/[أإآ]/g, "ا").replace(/ى/g, "ي").replace(/ة/g, "ه");
 
-export async function GET(req: Request) {
+async function handle(req: Request) {
   const p = new URL(req.url).searchParams;
   const lat = Number(p.get("lat")), lng = Number(p.get("lng"));
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return NextResponse.json({ error: "lat/lng required" }, { status: 400 });
   const radius = Math.min(Number(p.get("r")) || 5000, 25000);                 // cap at 25 km
   const q = norm(p.get("q") || "");
+  const category = (p.get("category") || "").replace(/[^a-z_]/g, "");
   const wanted = (p.get("features") || "").split(",").filter((f) => FEATURES.includes(f)); // whitelist
 
   const { rows } = await pool.query(
@@ -32,13 +33,26 @@ export async function GET(req: Request) {
                  coalesce(v.address_ar,'')||' '||coalesce(v.address_en,'')), 'أإآىة', 'ااايه') LIKE '%'||$4||'%')
         AND (SELECT count(*) FROM accessibility_attributes a
               WHERE a.venue_id = v.id AND a.feature::text = ANY($5::text[]) AND a.state = 'yes') = cardinality($5::text[])
+        AND ($6::text = '' OR v.category = $6::text)
       ORDER BY distance_m
       LIMIT 200`,
-    [lat, lng, radius, q, wanted]
+    [lat, lng, radius, q, wanted, category]
   );
   return NextResponse.json(
     rows.map((r: any) => ({ ...r, confidence: Number(r.confidence), distance_m: Math.round(r.distance_m),
                        name_ar: r.name_ar ?? r.name_en, name_en: r.name_en ?? r.name_ar,
                        address_ar: r.address_ar ?? "", address_en: r.address_en ?? "" }))
   );
+}
+
+// Wrapper: show the real database error as JSON instead of a blank "page isn't working".
+// (Fine for a school project; remove the error details before a real public launch.)
+export async function GET(req: Request) {
+  if (!process.env.DATABASE_URL)
+    return NextResponse.json({ error: "DATABASE_URL is not set on the server" }, { status: 500 });
+  try {
+    return await handle(req);
+  } catch (e: any) {
+    return NextResponse.json({ error: String(e?.message || e), code: e?.code ?? null }, { status: 500 });
+  }
 }
