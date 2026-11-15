@@ -1,24 +1,25 @@
-// scripts/import-osm.mjs — pull named places across Egypt from OpenStreetMap into PostGIS.
-// Run once after schema.sql:   npm i pg   &&   DATABASE_URL=postgres://... node scripts/import-osm.mjs
-// Optional: ONLY=cairo node scripts/import-osm.mjs   (cairo | alex | all, default all)
-// Data © OpenStreetMap contributors (ODbL). Keep the attribution in the app footer/map.
+// scripts/import-osm.mjs — import real named shops/places across Egypt from OpenStreetMap into PostGIS.
+// Usage:  npm i pg
+//   DATABASE_URL=postgres://... ONLY=cairo node scripts/import-osm.mjs     (Greater Cairo + Giza)
+//   ONLY=alex  -> Alexandria      |      ONLY=all (or leave out) -> all of Egypt (takes hours)
+// Data © OpenStreetMap contributors (ODbL). Keep the credit in the app.
 import pg from "pg";
 
-const OVERPASS = "https://overpass-api.de/api/interpreter";
+const OVERPASS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+];
 const ssl = process.env.DATABASE_URL?.includes("supabase") ? { rejectUnauthorized: false } : undefined;
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Egypt is large, so we query 1°x1° tiles and skip empty ones. [south, west, north, east]
-const EGYPT = [22.0, 25.0, 31.7, 36.9];
-const PRESETS = {
-  cairo: [29.75, 30.85, 30.25, 31.70],
-  alex: [30.95, 29.60, 31.40, 30.20],
-};
-function tiles(box, step = 0.5) {
+const EGYPT = [21.7, 24.7, 31.7, 36.9];            // [south, west, north, east]
+const PRESETS = { cairo: [29.75, 30.85, 30.25, 31.70], alex: [30.95, 29.60, 31.40, 30.20] };
+function tiles(box, step) {
   const [s, w, n, e] = box, out = [];
   for (let la = s; la < n; la += step)
-    for (let lo = w; lo < e; lo += step)
-      out.push([la, lo, Math.min(la + step, n), Math.min(lo + step, e)]);
+    for (let lo = w; lo < e; lo += step) out.push([la, lo, Math.min(la + step, n), Math.min(lo + step, e)]);
   return out;
 }
 
@@ -29,7 +30,6 @@ const query = ([s, w, n, e]) => `[out:json][timeout:180];
 );
 out center tags;`;
 
-// Map OpenStreetMap tags to the app's categories (all kinds of shops, no towns or landmarks).
 const SHOP = {
   mall: "mall", department_store: "mall", supermarket: "supermarket", convenience: "supermarket",
   greengrocer: "supermarket", bakery: "bakery", pastry: "bakery", chemist: "pharmacy",
@@ -48,8 +48,7 @@ function category(t) {
   if (["clinic", "hospital", "doctors", "dentist"].includes(a)) return "clinic";
   return SHOP[t.shop] || "shop";
 }
-
-// wheelchair=yes -> step_free yes; =no -> step_free no; =limited -> left unknown on purpose.
+// Real OSM wheelchair tags are kept as-is; wheelchair=limited is left unknown on purpose.
 function features(t) {
   const f = [];
   if (t.wheelchair === "yes" || t.wheelchair === "designated") f.push(["step_free", "yes"]);
@@ -61,59 +60,59 @@ function features(t) {
   return f;
 }
 
-async function save(client, el) {
-  const t = el.tags || {};
-  const lat = el.lat ?? el.center?.lat, lng = el.lon ?? el.center?.lon;
-  if (lat == null || lng == null) return;
-  const osmId = el.type === "node" ? el.id : -el.id;   // ways stored as negative ids; relations skipped below
-  if (el.type === "relation") return;
-  const nameAr = t["name:ar"] || (/[\u0600-\u06FF]/.test(t.name) ? t.name : null);
-  const nameEn = t["name:en"] || (/[\u0600-\u06FF]/.test(t.name) ? null : t.name);
-  const street = t["addr:street"];
-  const { rows } = await client.query(
+// One INSERT per tile (fast even over the internet). Exported so it can be tested.
+export async function saveBatch(client, elements) {
+  const rows = [];
+  for (const el of elements) {
+    if (el.type === "relation") continue;
+    const t = el.tags || {};
+    const lat = el.lat ?? el.center?.lat, lng = el.lon ?? el.center?.lon;
+    if (lat == null || lng == null || !t.name) continue;
+    const isAr = /[\u0600-\u06FF]/.test(t.name);
+    const street = t["addr:street"];
+    rows.push({
+      osm: el.type === "node" ? el.id : -el.id, // ways are stored as negative ids
+      ar: t["name:ar"] || (isAr ? t.name : null), en: t["name:en"] || (isAr ? null : t.name),
+      cat: category(t), lat, lng,
+      aAr: t["addr:street:ar"] || street || null, aEn: t["addr:street:en"] || street || null,
+      phone: t.phone || t["contact:phone"] || null, hours: t.opening_hours || null, feats: features(t),
+    });
+  }
+  if (!rows.length) return 0;
+  const col = (k) => rows.map((r) => r[k]);
+  const { rows: ids } = await client.query(
     `INSERT INTO venues (osm_id,name_ar,name_en,category,location,address_ar,address_en,phone,hours,source)
-     VALUES ($1,$2,$3,$4,ST_SetSRID(ST_MakePoint($5,$6),4326)::geography,$7,$8,$9,$10::jsonb,'osm')
-     ON CONFLICT (osm_id) DO UPDATE SET name_ar=EXCLUDED.name_ar,name_en=EXCLUDED.name_en,category=EXCLUDED.category
-     RETURNING id`,
-    [osmId, nameAr, nameEn, category(t), lng, lat,
-     t["addr:street:ar"] || street || null, t["addr:street:en"] || street || null,
-     t.phone || t["contact:phone"] || null,
-     t.opening_hours ? JSON.stringify(t.opening_hours) : null]
-  );
-  for (const [feature, state] of features(t)) {
-    // DO NOTHING so we never overwrite community-verified answers on re-import.
+     SELECT x.osm, x.ar, x.en, x.cat, ST_SetSRID(ST_MakePoint(x.lng,x.lat),4326)::geography, x.a_ar, x.a_en, x.phone,
+            CASE WHEN x.hours IS NULL THEN NULL ELSE to_jsonb(x.hours) END, 'osm'
+       FROM unnest($1::bigint[],$2::text[],$3::text[],$4::text[],$5::float8[],$6::float8[],$7::text[],$8::text[],$9::text[],$10::text[])
+            AS x(osm,ar,en,cat,lat,lng,a_ar,a_en,phone,hours)
+     ON CONFLICT (osm_id) DO UPDATE SET name_ar=EXCLUDED.name_ar, name_en=EXCLUDED.name_en, category=EXCLUDED.category
+     RETURNING id, osm_id`,
+    [col("osm"), col("ar"), col("en"), col("cat"), col("lat"), col("lng"), col("aAr"), col("aEn"), col("phone"), col("hours")]);
+  const idOf = new Map(ids.map((r) => [String(r.osm_id), r.id]));
+  const av = [], af = [], as = [];
+  for (const r of rows) for (const [f, s] of r.feats) { av.push(idOf.get(String(r.osm))); af.push(f); as.push(s); }
+  if (av.length)   // DO NOTHING so re-imports never overwrite community answers
     await client.query(
       `INSERT INTO accessibility_attributes (venue_id,feature,state,confidence)
-       VALUES ($1,$2,$3,0) ON CONFLICT DO NOTHING`, [rows[0].id, feature, state]);
-  }
+       SELECT v::uuid, f::feature_key, s::feature_state, 0 FROM unnest($1::text[],$2::text[],$3::text[]) AS x(v,f,s)
+       ON CONFLICT DO NOTHING`, [av, af, as]);
+  return rows.length;
 }
 
-const MIRRORS = [
-  "https://overpass-api.de/api/interpreter",
-  "https://overpass.kumi.systems/api/interpreter",
-  "https://overpass.private.coffee/api/interpreter",
-];
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// Ask Overpass for one tile. Tries each mirror in turn and prints the REAL reason when one fails.
 async function fetchTile(tile) {
   for (let attempt = 0; attempt < 3; attempt++) {
-    const url = MIRRORS[attempt % MIRRORS.length];
+    const url = OVERPASS[attempt % OVERPASS.length];
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": "accessible-egypt-importer/1.0 (community accessibility map)",
-          Accept: "*/*",
-        },
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "accessible-egypt-importer/1.0 (community accessibility map)", Accept: "*/*" },
         body: "data=" + encodeURIComponent(query(tile)),
       });
       const text = await res.text();
       if (!res.ok) throw new Error(`HTTP ${res.status} ${text.slice(0, 150).replace(/\s+/g, " ")}`);
       const json = JSON.parse(text);
-      if (json.remark && /runtime error|timed out|out of memory/i.test(json.remark))
-        throw new Error("Overpass says: " + json.remark.slice(0, 150));
+      if (json.remark && /runtime error|timed out|out of memory/i.test(json.remark)) throw new Error("Overpass says: " + json.remark.slice(0, 150));
       return json;
     } catch (err) {
       console.warn(`  [${new URL(url).host}] ${err.cause?.code || ""} ${err.message}`);
@@ -123,7 +122,7 @@ async function fetchTile(tile) {
   return null;
 }
 
-// If a tile is too big/busy, split it into 4 smaller tiles and try again (up to 3 levels).
+// Too big or busy? Split the tile into 4 and retry (up to 3 levels).
 async function processTile(tile, depth = 0) {
   const json = await fetchTile(tile);
   if (!json) {
@@ -134,29 +133,27 @@ async function processTile(tile, depth = 0) {
     for (const t of [[s, w, ms, mw], [s, mw, ms, e], [ms, w, n, mw], [ms, mw, n, e]]) sum += await processTile(t, depth + 1);
     return sum;
   }
-  if (!json.elements?.length) { await sleep(3000); return 0; }
+  if (!json.elements?.length) { await sleep(2000); return 0; }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    for (const el of json.elements) await save(client, el);
+    const n = await saveBatch(client, json.elements);
     await client.query("COMMIT");
-    console.log(`tile ${tile.map((x) => x.toFixed(2)).join(",")}: ${json.elements.length} places`);
-    return json.elements.length;
+    console.log(`tile ${tile.map((x) => x.toFixed(2)).join(",")}: ${n} places`);
+    return n;
   } catch (err) {
     await client.query("ROLLBACK"); console.error("  database error:", err.message); return 0;
   } finally { client.release(); }
 }
 
-// Check the database first so a DB problem isn't mistaken for a network problem.
-try { await pool.query("select 1"); console.log("Database connection OK"); }
-catch (err) { console.error("Cannot connect to the database:", err.message); process.exit(1); }
-
-const only = process.env.ONLY || "all";
-const box = PRESETS[only] || EGYPT;
-let total = 0;
-for (const tile of tiles(box, PRESETS[only] ? 0.2 : 0.5)) {
-  total += await processTile(tile);
-  await sleep(4000);   // be polite to the free Overpass servers
+async function main() {
+  try { await pool.query("select 1"); console.log("Database connection OK"); }
+  catch (err) { console.error("Cannot connect to the database:", err.message); process.exit(1); }
+  const only = process.env.ONLY || "all";
+  const box = PRESETS[only] || EGYPT;
+  let total = 0;
+  for (const tile of tiles(box, PRESETS[only] ? 0.2 : 0.5)) { total += await processTile(tile); await sleep(3000); }
+  await pool.end();
+  console.log("Done:", total, "places imported");
 }
-await pool.end();
-console.log("Done:", total, "places imported");
+if (process.env.IMPORT_TEST !== "1") await main();
