@@ -12,6 +12,7 @@ const OVERPASS = [
 ];
 const ssl = process.env.DATABASE_URL?.includes("supabase") ? { rejectUnauthorized: false } : undefined;
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl });
+let SAMPLE = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const EGYPT = [21.7, 24.7, 31.7, 36.9];            // [south, west, north, east]
@@ -61,7 +62,7 @@ function features(t) {
 }
 
 // One INSERT per tile (fast even over the internet). Exported so it can be tested.
-export async function saveBatch(client, elements) {
+export async function saveBatch(client, elements, opts = {}) {
   const rows = [];
   for (const el of elements) {
     if (el.type === "relation") continue;
@@ -97,6 +98,8 @@ export async function saveBatch(client, elements) {
       `INSERT INTO accessibility_attributes (venue_id,feature,state,confidence)
        SELECT v::uuid, f::feature_key, s::feature_state, 0 FROM unnest($1::text[],$2::text[],$3::text[]) AS x(v,f,s)
        ON CONFLICT DO NOTHING`, [av, af, as]);
+  // Give the new places sample features right away (needs fill_sample_access from sample-access.sql)
+  if (opts.sample) await client.query("SELECT fill_sample_access($1::uuid[])", [ids.map((r) => r.id)]);
   return rows.length;
 }
 
@@ -137,7 +140,7 @@ async function processTile(tile, depth = 0) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const n = await saveBatch(client, json.elements);
+    const n = await saveBatch(client, json.elements, { sample: SAMPLE });
     await client.query("COMMIT");
     console.log(`tile ${tile.map((x) => x.toFixed(2)).join(",")}: ${n} places`);
     return n;
@@ -149,6 +152,11 @@ async function processTile(tile, depth = 0) {
 async function main() {
   try { await pool.query("select 1"); console.log("Database connection OK"); }
   catch (err) { console.error("Cannot connect to the database:", err.message); process.exit(1); }
+  if (process.env.SAMPLE !== "0") {
+    const { rows } = await pool.query("select to_regproc('fill_sample_access') is not null as ok");
+    SAMPLE = rows[0].ok;
+    console.log(SAMPLE ? "Sample accessibility features: ON" : "NOTE: run sample-access.sql in Supabase first, so new places get features automatically.");
+  }
   const only = process.env.ONLY || "all";
   const box = PRESETS[only] || EGYPT;
   let total = 0;

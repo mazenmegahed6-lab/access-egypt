@@ -424,6 +424,13 @@ export default function Home() {
                 <button onClick={() => { setSelected(null); clearRoute(); }} aria-label={t.close} className="min-h-[44px] min-w-[44px] text-2xl">×</button>
               </div>
               <p>{addr(selected)}{hoursText(selected) ? ` · ${hoursText(selected)}` : ""}</p>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {FEATURES.filter((f) => selected.features[f.key]).map((f) => (
+                  <span key={f.key} className={`px-2 py-0.5 rounded text-sm font-semibold ${selected.features[f.key] === "yes" ? "bg-[#0B6B2E] text-white" : "bg-[#8A1C00] text-white"}`}>
+                    {lang === "ar" ? f.ar : f.en}: {selected.features[f.key] === "yes" ? "✓" : "✗"}
+                  </span>
+                ))}
+              </div>
               {route && <p className="mt-2 font-semibold">{t.route}: {route.km.toFixed(1)} {t.km} · ~{route.min} {t.min} {t.walk}</p>}
               {route && <p className="text-sm">{t.routeNote}</p>}
               <div className="mt-3 flex flex-wrap gap-2">
